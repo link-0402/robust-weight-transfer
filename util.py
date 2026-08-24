@@ -83,12 +83,15 @@ def draw_debug_vertex_colors(obj, matched):
     mesh: bpy.types.Mesh = obj.data
     if not isinstance(mesh, bpy.types.Mesh): return
 
-    if "RBT Matched" in mesh.vertex_colors:
-        color_layer = mesh.vertex_colors["RBT Matched"]
+    color_attributes = mesh.color_attributes
+    if "RBT Matched" in color_attributes:
+        color_layer = color_attributes["RBT Matched"]
+        if color_layer.domain != 'CORNER' or color_layer.data_type not in {'BYTE_COLOR', 'FLOAT_COLOR'}:
+            color_attributes.remove(color_layer)
+            color_layer = color_attributes.new(name="RBT Matched", type='BYTE_COLOR', domain='CORNER')
     else:
-        color_layer = mesh.vertex_colors.new(name="RBT Matched")
+        color_layer = color_attributes.new(name="RBT Matched", type='BYTE_COLOR', domain='CORNER')
     if not color_layer: return False
-    color_layer.active = True
     loop_ind = np.zeros(len(mesh.loops), dtype=np.int64)
     mesh.loops.foreach_get('vertex_index', loop_ind)
     loop_matched = matched[loop_ind]
@@ -96,7 +99,8 @@ def draw_debug_vertex_colors(obj, matched):
     color_data[~loop_matched] = [234/255, 0, 255/255, 1.0]
     color_layer.data.foreach_set("color", color_data.reshape(-1))
     mesh.update()
-    mesh.vertex_colors.active = color_layer
+    color_attributes.active_color = color_layer
+    color_attributes.render_color_index = color_attributes.find(color_layer.name)
     return True
     
     
@@ -107,15 +111,22 @@ TOPOLOGY_MODS = {
     'BUILD',
     'DECIMATE',
     'EDGE_SPLIT',
+    'EXPLODE',
+    'FLUID',
     'MASK',
+    'MESH_TO_VOLUME',
     'MIRROR',
     'MULTIRES',
+    'NODES',
+    'OCEAN',
+    'PARTICLE_INSTANCE',
     'REMESH',
     'SCREW',
     'SKIN',
     'SOLIDIFY',
     'SUBSURF',
     'TRIANGULATE',
+    'VOLUME_TO_MESH',
     'WELD',
     'WIREFRAME'
 }
@@ -123,7 +134,7 @@ TOPOLOGY_MODS = {
 
 def has_modifier(obj: bpy.types.Object, *mod_types):
     if obj and obj.type == 'MESH' and obj.modifiers:
-        return any(mod.type in mod_types for mod in obj.modifiers)
+        return any(mod.show_viewport and mod.type in mod_types for mod in obj.modifiers)
     return False
 
 

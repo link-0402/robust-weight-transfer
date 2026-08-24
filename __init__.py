@@ -20,8 +20,8 @@
 bl_info = {
     "name": "Robust Weight Transfer",
     "author": "sentfromspacevr",
-    "version": (1, 1, 9),
-    "blender": (3, 1, 0),
+    "version": (1, 2, 0),
+    "blender": (5, 2, 0),
     "doc_url": "https://jinxxy.com/SentFromSpaceVR/robust-weight-transfer",
     "location": "View3D > Sidebar > SENT Tab",
     "category": "Object",
@@ -29,7 +29,6 @@ bl_info = {
 
 import sys
 import os
-import sysconfig
 import site
 
 import bpy
@@ -41,30 +40,41 @@ import importlib
 import subprocess
 import bpy.utils.previews
 
-libs_path = os.path.join(os.path.dirname(__file__), 'deps')
-scheme = sysconfig.get_preferred_scheme("user")
-user_site = sysconfig.get_paths(scheme, vars={"userbase": libs_path})["purelib"]
-site.addsitedir(user_site)
+libs_path = os.path.join(os.path.dirname(__file__), "deps")
+# Dependencies are installed directly into this add-on-owned directory.  This
+# avoids Blender's read-only Python installation and the fragile --user /
+# PYTHONUSERBASE combination used by older releases of the add-on.
+site.addsitedir(libs_path)
 
-DEPENDENCIES = ["robust_laplacian", "igl", "scipy"]
+DEPENDENCIES = ["robust_laplacian", "scipy"]
+DEPENDENCY_PACKAGES = {
+    "robust_laplacian": "robust-laplacian==1.0.0",
+    "scipy": "scipy>=1.16.2,<2",
+}
 missing_deps = []
 for module in DEPENDENCIES:
     try:
         importlib.import_module(module)
     except ImportError:
-        if module == "igl":
-            missing_deps.append("libigl==2.5.1")
-        else:
-            missing_deps.append(module)
+        missing_deps.append(DEPENDENCY_PACKAGES[module])
 
 installed_deps = False
 
 print(missing_deps)
 
 if not missing_deps:
-    import igl
-    from .weighttransfer import find_matches_closest_surface, inpaint, limit_mask, smooth_weigths
-    from . import util
+    import scipy as sp
+    weighttransfer_module_name = f"{__name__}.weighttransfer"
+    util_module_name = f"{__name__}.util"
+    # Blender's legacy ZIP installer replaces files and immediately enables the
+    # add-on in the same Python process. Evict cached helpers so an in-place
+    # upgrade cannot combine a new __init__.py with old module implementations.
+    sys.modules.pop(weighttransfer_module_name, None)
+    sys.modules.pop(util_module_name, None)
+    importlib.invalidate_caches()
+    weighttransfer = importlib.import_module('.weighttransfer', __name__)
+    util = importlib.import_module('.util', __name__)
+    from .weighttransfer import build_surface_bvh, find_matches_closest_surface, find_vertex_merge_map, inpaint, limit_mask, smooth_weigths
 
 
 class RobustWeightTransfer(bpy.types.Operator):
@@ -125,13 +135,31 @@ class RobustWeightTransfer(bpy.types.Operator):
         
         weights_all = [] # (num_objs, (num_vertices, num_weights))
         source_verts, source_triangles, source_normals = util.get_obj_arrs_world(source_obj)
+        if len(source_verts) == 0 or len(source_triangles) == 0:
+            self.report({'ERROR'}, f'Source object {source_obj.name} must contain vertices and faces')
+            return {'CANCELLED'}
+
         deform_only = scene_settings.group_selection == 'DEFORM_POSE_BONES'
         is_deform = [util.is_vertex_group_deform_bone(source_obj, g.name) for g in source_obj.vertex_groups]
         source_weights = util.get_groups_arr(source_obj, is_deform if deform_only else None) # (num_verts, )
+        if source_weights.shape[1] == 0 or (deform_only and not np.any(is_deform)):
+            group_kind = 'deform-bone vertex groups' if deform_only else 'vertex groups'
+            self.report({'ERROR'}, f'Source object {source_obj.name} has no {group_kind} to transfer')
+            return {'CANCELLED'}
+
+        try:
+            surface_bvh = build_surface_bvh(source_verts, source_triangles)
+        except ValueError as error:
+            self.report({'ERROR'}, str(error))
+            return {'CANCELLED'}
+
         for obj in target_objs:
             object_settings: ObjectSettingsGroup = obj.robust_weight_transfer_settings
             verts, triangles, normals = util.get_obj_arrs_world(obj.evaluated_get(depsgraph) if scene_settings.use_deformed_target else obj)
-            matched_verts, weights = find_matches_closest_surface(source_verts, source_triangles, source_normals, verts, normals, source_weights, scene_settings.max_distance**2, math.degrees(scene_settings.max_normal_angle_difference), scene_settings.flip_vertex_normal)
+            if len(verts) == 0 or len(triangles) == 0:
+                self.report({'ERROR'}, f'Target object {obj.name} must contain vertices and faces')
+                return {'CANCELLED'}
+            matched_verts, weights = find_matches_closest_surface(source_verts, source_triangles, source_normals, verts, normals, source_weights, scene_settings.max_distance**2, math.degrees(scene_settings.max_normal_angle_difference), scene_settings.flip_vertex_normal, surface_bvh)
             if not scene_settings.apply_to_selected:
                 if util.is_group_valid(obj.vertex_groups, object_settings.inpaint_group):
                     inpaint_mask = util.get_group_arr(obj, object_settings.inpaint_group)
@@ -148,9 +176,16 @@ class RobustWeightTransfer(bpy.types.Operator):
                     return {'CANCELLED'}
 
                 
-            result, weights = inpaint(verts, triangles, weights, matched_verts, scene_settings.inpaint_mode == 'POINT')
+            virtual_merge_distance = (
+                scene_settings.virtual_merge_distance
+                if scene_settings.virtual_merge else 0.0
+            )
+            result, weights = inpaint(
+                verts, triangles, weights, matched_verts,
+                scene_settings.inpaint_mode == 'POINT', virtual_merge_distance
+            )
             if not result:
-                self.report({'ERROR'}, f'Failed weight inpainting on {obj.name}: This usually happens on loose parts, where vertices are not finding a match on the source mesh. Use Select Rejected Loose Parts to solve the issue.')
+                self.report({'ERROR'}, f'Failed weight inpainting on {obj.name}: This usually happens on loose parts without a matched vertex. Try Virtual Merge by Distance or use Select Rejected Loose Parts.')
                 return {'CANCELLED'}
             
             adj_mat = util.get_mesh_adjacency_matrix_sparse(obj.data, include_self=True)
@@ -166,6 +201,7 @@ class RobustWeightTransfer(bpy.types.Operator):
             
             weights_all.append(weights)
         for obj, weights in zip(target_objs, weights_all):
+            object_settings: ObjectSettingsGroup = obj.robust_weight_transfer_settings
             source_vertex_groups = source_obj.vertex_groups
             weight_counts = np.count_nonzero(weights, axis=0)
             for group, w_count in zip(source_vertex_groups, weight_counts):
@@ -244,14 +280,29 @@ class SelectNonMatched(bpy.types.Operator):
             source_obj = source_obj.evaluated_get(depsgraph)
         
         source_verts, source_triangles, source_normals = util.get_obj_arrs_world(source_obj)
+        if len(source_verts) == 0 or len(source_triangles) == 0:
+            self.report({'ERROR'}, f'Source object {source_obj.name} must contain vertices and faces')
+            return {'CANCELLED'}
         
         deform_only = scene_settings.group_selection == 'DEFORM_POSE_BONES'
         is_deform = [util.is_vertex_group_deform_bone(source_obj, g.name) for g in source_obj.vertex_groups]
         source_weights = util.get_groups_arr(source_obj, is_deform if deform_only else None)
+        if source_weights.shape[1] == 0 or (deform_only and not np.any(is_deform)):
+            group_kind = 'deform-bone vertex groups' if deform_only else 'vertex groups'
+            self.report({'ERROR'}, f'Source object {source_obj.name} has no {group_kind} to transfer')
+            return {'CANCELLED'}
         
         obj = context.active_object
         verts, triangles, normals = util.get_obj_arrs_world(obj.evaluated_get(depsgraph) if scene_settings.use_deformed_target else obj)
-        matched_verts, weights = find_matches_closest_surface(source_verts, source_triangles, source_normals, verts, normals, source_weights, scene_settings.max_distance**2, math.degrees(scene_settings.max_normal_angle_difference), scene_settings.flip_vertex_normal)
+        if len(verts) == 0 or len(triangles) == 0:
+            self.report({'ERROR'}, f'Target object {obj.name} must contain vertices and faces')
+            return {'CANCELLED'}
+        try:
+            surface_bvh = build_surface_bvh(source_verts, source_triangles)
+        except ValueError as error:
+            self.report({'ERROR'}, str(error))
+            return {'CANCELLED'}
+        matched_verts, weights = find_matches_closest_surface(source_verts, source_triangles, source_normals, verts, normals, source_weights, scene_settings.max_distance**2, math.degrees(scene_settings.max_normal_angle_difference), scene_settings.flip_vertex_normal, surface_bvh)
         
         if not scene_settings.apply_to_selected:
             object_settings: ObjectSettingsGroup = obj.robust_weight_transfer_settings
@@ -264,7 +315,41 @@ class SelectNonMatched(bpy.types.Operator):
                 matched_verts = np.logical_and(matched_verts, ~inpaint_mask_bin)
         
         # get loose part meshes
-        num_conn, conn, num_vertices = igl.connected_components(igl.adjacency_matrix(triangles))
+        rows = np.hstack((triangles[:, 0], triangles[:, 1], triangles[:, 2]))
+        cols = np.hstack((triangles[:, 1], triangles[:, 2], triangles[:, 0]))
+        adjacency = sp.sparse.coo_matrix(
+            (np.ones(rows.size * 2),
+             (np.hstack((rows, cols)), np.hstack((cols, rows)))),
+            shape=(len(verts), len(verts)),
+        ).tocsr()
+        if scene_settings.virtual_merge and scene_settings.virtual_merge_distance > 0:
+            try:
+                merge_map = find_vertex_merge_map(
+                    verts, scene_settings.virtual_merge_distance
+                )
+            except ValueError as error:
+                self.report({'ERROR'}, str(error))
+                return {'CANCELLED'}
+            cluster_count = int(merge_map.max()) + 1 if len(merge_map) else 0
+            representatives = np.full(cluster_count, len(verts), dtype=np.int64)
+            np.minimum.at(representatives, merge_map, np.arange(len(verts)))
+            vertex_indices = np.arange(len(verts), dtype=np.int64)
+            representative_indices = representatives[merge_map]
+            virtual_edges = vertex_indices != representative_indices
+            virtual_rows = vertex_indices[virtual_edges]
+            virtual_cols = representative_indices[virtual_edges]
+            if len(virtual_rows):
+                adjacency += sp.sparse.coo_matrix(
+                    (
+                        np.ones(virtual_rows.size * 2),
+                        (
+                            np.hstack((virtual_rows, virtual_cols)),
+                            np.hstack((virtual_cols, virtual_rows)),
+                        ),
+                    ),
+                    shape=adjacency.shape,
+                ).tocsr()
+        num_conn, conn = sp.sparse.csgraph.connected_components(adjacency, directed=False)
         conns = [np.where(conn == i)[0] for i in range(num_conn)]
         matched_per_submesh = [np.count_nonzero(matched_verts[c]) for c in conns]
         zero_matched_submeshes = [i for i, m in enumerate(matched_per_submesh) if m == 0]
@@ -277,7 +362,7 @@ class SelectNonMatched(bpy.types.Operator):
         mesh = bmesh.from_edit_mesh(obj.data)
         mesh.verts.ensure_lookup_table()
         for i, x in enumerate(selects):
-            mesh.verts[i].select_set(x)
+            mesh.verts[i].select_set(bool(x))
         mesh.select_flush(True)
         mesh.select_flush(False)
         bmesh.update_edit_mesh(obj.data, destructive=False)
@@ -294,10 +379,11 @@ class Inpaint(bpy.types.Operator):
     
     @classmethod
     def poll(cls, context):
+        if not context.active_object: return False
+        if context.active_object.type != 'MESH': return False
+        if context.mode != 'OBJECT' and context.mode != 'PAINT_WEIGHT': return False
         scene_settings: SceneSettingsGroup = context.scene.robust_weight_transfer_settings
         object_settings: ObjectSettingsGroup = context.active_object.robust_weight_transfer_settings
-        
-        if not context.active_object: return False
         if len(object_settings.inpaint_group) == 0 or object_settings.inpaint_group not in context.active_object.vertex_groups: return False
         
         if scene_settings.use_deformed_target and util.has_modifier(context.active_object, *util.TOPOLOGY_MODS): return False
@@ -315,9 +401,16 @@ class Inpaint(bpy.types.Operator):
 
         inpaint_mask = util.get_group_arr(obj, object_settings.inpaint_group)
         inpaint_mask_bin = inpaint_mask > object_settings.inpaint_threshold
-        result, weights = inpaint(verts, triangles, weights, ~inpaint_mask_bin, scene_settings.inpaint_mode == 'POINT')
+        virtual_merge_distance = (
+            scene_settings.virtual_merge_distance
+            if scene_settings.virtual_merge else 0.0
+        )
+        result, weights = inpaint(
+            verts, triangles, weights, ~inpaint_mask_bin,
+            scene_settings.inpaint_mode == 'POINT', virtual_merge_distance
+        )
         if not result:
-            self.report({'ERROR'}, f'Failed weight inpainting on {obj.name}: This usually happens on loose parts, where vertices are not finding a match on the source mesh. Use Select Rejected Loose Parts to solve the issue.')
+            self.report({'ERROR'}, f'Failed weight inpainting on {obj.name}: This usually happens on loose parts without a known weight. Try Virtual Merge by Distance or use Select Rejected Loose Parts.')
             return {'CANCELLED'}
 
         for i, w in enumerate(weights.T):
@@ -422,6 +515,19 @@ class SceneSettingsGroup(bpy.types.PropertyGroup):
             ('SURFACE', 'Surface', 'Mesh is used as is. Weights "flow" only inside a mesh/loose part. More likely to fail compared to "Point"')
         ],
         default='POINT')
+    virtual_merge: bpy.props.BoolProperty(
+        name='Virtual Merge by Distance',
+        description='Temporarily weld nearby vertices only for weight inpainting. The mesh topology, normals, UVs, shape keys, and modifiers are not changed',
+        default=False)
+    virtual_merge_distance: bpy.props.FloatProperty(
+        name='Virtual Merge Distance',
+        description='World-space distance used to connect loose parts during weight inpainting',
+        default=0.0001,
+        min=0,
+        soft_max=0.01,
+        precision=5,
+        unit='LENGTH',
+        subtype='DISTANCE')
     smoothing_enable: bpy.props.BoolProperty(
         name='Enable Smoothing',
         description='Smooths weights in the area where weights got inpainted',
@@ -476,8 +582,7 @@ class RobustWeightTransferPanel(bpy.types.Panel):
         # Object field for source
         row = layout.row(align=True)
         row.prop(settings, "source_object")
-        row.prop(settings, "use_deformed_source",toggle=True, text="", icon='SHAPEKEY_DATA')
-        row.prop(settings, "use_deformed_source",toggle=True, text="", icon='MODIFIER')
+        row.prop(settings, "use_deformed_source", toggle=True, text="", icon='MODIFIER')
         
         # Vertex group field
         row = layout.row()
@@ -502,7 +607,7 @@ class RobustWeightTransferPanel(bpy.types.Panel):
             col.label(text='  Deactivate Use Deformed Target or apply/delete modifier.', icon='MODIFIER')
             
         source_obj = settings.source_object
-        if source_obj:
+        if source_obj and settings.group_selection == 'DEFORM_POSE_BONES':
             armature_mods = [mod for mod in source_obj.modifiers if mod.type == "ARMATURE"]
             if len(armature_mods) == 0:
                 col = layout.column(align=True)
@@ -521,8 +626,7 @@ class RobustWeightTransferPanel(bpy.types.Panel):
         row = layout.row(align=True)
         row.prop(settings, 'apply_to_selected', text='', icon='RESTRICT_SELECT_OFF')
         row.operator("object.skin_weight_transfer", text="Transfer Weights")
-        row.prop(settings, "use_deformed_target",toggle=True, text="", icon='SHAPEKEY_DATA')
-        row.prop(settings, "use_deformed_target",toggle=True, text="", icon='MODIFIER')
+        row.prop(settings, "use_deformed_target", toggle=True, text="", icon='MODIFIER')
         
         layout.separator(factor=1)
         
@@ -549,6 +653,10 @@ class SettingsPanel(bpy.types.Panel):
         settings = context.scene.robust_weight_transfer_settings
         layout.operator('object.rbt_reset_scene_settings', icon='LOOP_BACK', text='Reset to Defaults')
         layout.prop(settings, 'inpaint_mode')
+        layout.prop(settings, 'virtual_merge')
+        row = layout.row()
+        row.enabled = settings.virtual_merge
+        row.prop(settings, 'virtual_merge_distance')
         layout.prop(settings, 'draw_matched')
         row = layout.row()
         row.enabled = not settings.enforce_four_bone_limit
@@ -666,6 +774,9 @@ class SmoothLimit(bpy.types.Operator):
         scene_settings = context.scene.robust_weight_transfer_settings
         obj = context.active_object
         is_deform = [util.is_vertex_group_deform_bone(obj, g.name) for g in obj.vertex_groups]
+        if not np.any(is_deform):
+            self.report({'ERROR'}, f'{obj.name} has no deform-bone vertex groups to limit')
+            return {'CANCELLED'}
         W = util.get_groups_arr(obj, is_deform)
         adj_mat = util.get_mesh_adjacency_matrix_sparse(obj.data, True)
         mask = limit_mask(W, adj_mat, limit_num=scene_settings.num_limit_groups)
@@ -683,25 +794,38 @@ class InstallDependencies(bpy.types.Operator):
     
     def execute(self, context):
         python_exe = sys.executable
-        print(python_exe)
+        os.makedirs(libs_path, exist_ok=True)
+        command = [
+            python_exe, "-m", "pip", "install",
+            "--target", libs_path,
+            "--upgrade",
+            "--only-binary=:all:",
+            "--no-deps",
+            *missing_deps,
+        ]
+        print("Robust Weight Transfer dependency command:", command)
         try:
-            # create a constraints.txt to constrain the dependency install to the numpy version that blender ships with
-            constraints_path = os.path.join(os.path.dirname(__file__), "constraints.txt")
-            with open(constraints_path, "w") as f:
-                f.write(f"numpy=={np.__version__}\n")
-                f.write(f"robust_laplacian==1.0.0\n") 
-
-            # we do a pip user install under a custom user base path
-            # makes use of existing installed python packages like numpy, still uses pips dependency resolution and keeps it isolated
-            env = os.environ.copy()
-            env["PYTHONUSERBASE"] = libs_path
-            subprocess.check_call([python_exe, "-m", "pip", "install", "--user", *missing_deps, "--break-system-packages", "-c", constraints_path], env=env)
+            result = subprocess.run(
+                command,
+                check=True,
+                text=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+            )
+            print(result.stdout)
             self.report({'INFO'}, "Installation successful! Please restart Blender.")
             global installed_deps
             installed_deps = True
             return {'FINISHED'}
         except subprocess.CalledProcessError as e:
-            self.report({'ERROR'}, f"Installation failed: {str(e)}")
+            details = (e.stdout or str(e)).strip()
+            print("Robust Weight Transfer dependency installation failed:\n", details)
+            last_line = details.splitlines()[-1] if details else str(e)
+            self.report({'ERROR'}, f"Dependency installation failed: {last_line}. See System Console.")
+            return {'CANCELLED'}
+        except OSError as e:
+            print("Robust Weight Transfer could not start pip:", e)
+            self.report({'ERROR'}, f"Could not start Blender Python/pip: {e}")
             return {'CANCELLED'}
 
 class SentFromSpacePanel(bpy.types.Panel):
@@ -810,24 +934,24 @@ class SentFromSpacePanel(bpy.types.Panel):
 
 def register():
     # bpy.types.VIEW3D_MT_make_links.append(menu_func)
-    bpy.utils.register_class(RobustWeightTransfer)
     bpy.utils.register_class(RobustWeightTransferPanel)
     if missing_deps:
         bpy.utils.register_class(InstallDependencies)
     else:
+        bpy.utils.register_class(ObjectSettingsGroup)
+        bpy.utils.register_class(SceneSettingsGroup)
+        bpy.types.Object.robust_weight_transfer_settings = bpy.props.PointerProperty(type=ObjectSettingsGroup)
+        bpy.types.Scene.robust_weight_transfer_settings = bpy.props.PointerProperty(type=SceneSettingsGroup)
+        bpy.utils.register_class(RobustWeightTransfer)
         bpy.utils.register_class(SettingsPanel)
         bpy.utils.register_class(VertexMappingPanel)
         bpy.utils.register_class(LimitGroupsPanel)
         bpy.utils.register_class(SmoothingPanel)
-        bpy.utils.register_class(ObjectSettingsGroup)
-        bpy.utils.register_class(SceneSettingsGroup)
         bpy.utils.register_class(SelectNonMatched)
         bpy.utils.register_class(ResetSceneSettings)
         bpy.utils.register_class(UtilitiesPanel)
         bpy.utils.register_class(SmoothLimit)
         bpy.utils.register_class(Inpaint)
-        bpy.types.Object.robust_weight_transfer_settings = bpy.props.PointerProperty(type=ObjectSettingsGroup)
-        bpy.types.Scene.robust_weight_transfer_settings = bpy.props.PointerProperty(type=SceneSettingsGroup)
         
     if 'VIEW3D_PT_sent_from_space_panel' in dir(bpy.types):
         if SentFromSpacePanel.version > bpy.types.VIEW3D_PT_sent_from_space_panel.version:
@@ -840,25 +964,25 @@ def register():
     
 def unregister():
     # bpy.types.VIEW3D_MT_make_links.remove(menu_func)
-    bpy.utils.unregister_class(RobustWeightTransfer)
-    bpy.utils.unregister_class(RobustWeightTransferPanel)
+    SentFromSpacePanel._unregister()
     if missing_deps:
         bpy.utils.unregister_class(InstallDependencies)
     else:
-        bpy.utils.unregister_class(SettingsPanel)
-        bpy.utils.unregister_class(VertexMappingPanel)
-        bpy.utils.unregister_class(LimitGroupsPanel)
-        bpy.utils.unregister_class(SmoothingPanel)
-        bpy.utils.unregister_class(ObjectSettingsGroup)
-        bpy.utils.unregister_class(SceneSettingsGroup)
-        bpy.utils.unregister_class(SelectNonMatched)
-        bpy.utils.unregister_class(ResetSceneSettings)
-        bpy.utils.unregister_class(UtilitiesPanel)
-        bpy.utils.unregister_class(SmoothLimit)
         bpy.utils.unregister_class(Inpaint)
+        bpy.utils.unregister_class(SmoothLimit)
+        bpy.utils.unregister_class(UtilitiesPanel)
+        bpy.utils.unregister_class(ResetSceneSettings)
+        bpy.utils.unregister_class(SelectNonMatched)
+        bpy.utils.unregister_class(SmoothingPanel)
+        bpy.utils.unregister_class(LimitGroupsPanel)
+        bpy.utils.unregister_class(VertexMappingPanel)
+        bpy.utils.unregister_class(SettingsPanel)
+        bpy.utils.unregister_class(RobustWeightTransfer)
         del bpy.types.Object.robust_weight_transfer_settings
         del bpy.types.Scene.robust_weight_transfer_settings
-    SentFromSpacePanel._unregister()
+        bpy.utils.unregister_class(SceneSettingsGroup)
+        bpy.utils.unregister_class(ObjectSettingsGroup)
+    bpy.utils.unregister_class(RobustWeightTransferPanel)
     
 
 if __name__ == "__main__":
