@@ -40,7 +40,7 @@ You can find the project page here https://www.dgp.toronto.edu/~rinat/projects/R
 
 When using the addon for academic work please cite them!
 
-Changes to the original work:
+### Changes to the original addon/repository:
 - Allow flipped normals 
     - Handles solid meshes when vertex normals show into opposite direction of the vertex normals on the body
 - Remesh using Robust Laplacian's point cloud Laplacian (During Point mode)
@@ -66,6 +66,3 @@ solver, then the computed weights are mapped back to the original vertices.
 The actual mesh topology, split normals, UV seams, shape keys, and modifiers
 remain unchanged. Use the smallest distance that connects the intended seams;
 an unnecessarily large value can connect unrelated nearby surfaces.
-
-The add-on also supports installing an update over an already loaded older
-version without requiring Blender to discard cached add-on modules first.
