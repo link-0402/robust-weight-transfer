@@ -28,18 +28,6 @@ python -m pip download --platform win_amd64 --python-version 313 --only-binary=:
 ```
 The dependency wheels get downloaded into the `whl` directory. From here you can unzip the content of the wheels into the `deps` directory
 
-### VS Code Blender Extension
-
-I recommend using https://github.com/JacquesLucke/blender_vscode during development.
-
-## Academic Work
-
-This Blender addon is based on "Robust Skin Weights Transfer via Weight Inpainting" by Rinat Abdrashitov, Kim Raichstat, Jared Monsen and David Hill published at SIGGRAPH ASIA 2023
-
-You can find the project page here https://www.dgp.toronto.edu/~rinat/projects/RobustSkinWeightsTransfer/index.html
-
-When using the addon for academic work please cite them!
-
 ### Changes to the original addon/repository:
 - Allow flipped normals 
     - Handles solid meshes when vertex normals show into opposite direction of the vertex normals on the body
@@ -176,18 +164,3 @@ changes locked groups. If locked or protected values leave no feasible way to
 normalize or balance a pair, the add-on preserves those values and reports a
 warning. These options apply to **Transfer Weights** only; Utilities → Inpaint
 remains unchanged.
-
-### Regression tests
-
-Run the numerical and operator integration suite in Blender with the add-on's
-dependencies available. An optional final argument supplies a separate dependency
-directory without installing anything into Blender:
-
-```text
-blender --background --factory-startup --python-exit-code 1 --python tests/test_blender.py -- /path/to/deps
-```
-
-The suite creates disposable scenes in the background process. It covers solver
-connectivity, virtual merges, final seam equality, protected weights, batch
-recovery, and evaluated deformation under bone translation, rotation, and
-nonuniform scaling.
