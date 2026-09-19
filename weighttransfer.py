@@ -49,6 +49,7 @@
 # SOFTWARE.
 
 import warnings
+from dataclasses import dataclass
 
 import numpy as np
 import scipy as sp
@@ -187,7 +188,7 @@ def normalize_vec(v):
     return v/np.linalg.norm(v)
 
 
-def find_matches_closest_surface(source_verts, source_triangles, source_normals, target_verts, target_normals, source_weights, dDISTANCE_THRESHOLD_SQRD, dANGLE_THRESHOLD_DEGREES, flip_vertex_normal, surface_bvh=None):
+def find_matches_closest_surface(source_verts, source_triangles, source_normals, target_verts, target_normals, source_weights, dDISTANCE_THRESHOLD_SQRD, dANGLE_THRESHOLD_DEGREES, flip_vertex_normal, surface_bvh=None, return_distances=False):
     """
     For each vertex on the target mesh find a match on the source mesh.
 
@@ -208,6 +209,7 @@ def find_matches_closest_surface(source_verts, source_triangles, source_normals,
     Returns:
         Matched: #V2 array of bools, where Matched[i] is True if we found a good match for vertex i on the source mesh
         W2: #V2 by num_bones, where W2[i,:] are skinning weights copied directly from source using closest point method
+        sqrD: optional third result, squared world-space surface distances
     """
     sqrD,I,C,B = find_closest_point_on_surface(
         target_verts, source_verts, source_triangles, surface_bvh
@@ -242,12 +244,60 @@ def find_matches_closest_surface(source_verts, source_triangles, source_normals,
         is_deg_threshold = np.logical_or(is_deg_threshold, deg_angles_mirror <= angle_thresholds)
 
     Matched = np.logical_and(is_distance_threshold, is_deg_threshold)    
-    return Matched, W2
+    return (Matched, W2, sqrD) if return_distances else (Matched, W2)
+
+
+def _union_find_components(vertex_count, edges):
+    """Return connected-component labels without scipy.sparse.csgraph."""
+    parent = np.arange(vertex_count, dtype=np.int64)
+    rank = np.zeros(vertex_count, dtype=np.uint8)
+
+    def find(vertex):
+        root = vertex
+        while parent[root] != root:
+            root = parent[root]
+        while parent[vertex] != vertex:
+            next_vertex = parent[vertex]
+            parent[vertex] = root
+            vertex = next_vertex
+        return root
+
+    for left, right in np.asarray(edges, dtype=np.int64).reshape(-1, 2):
+        left_root = find(int(left))
+        right_root = find(int(right))
+        if left_root == right_root:
+            continue
+        if rank[left_root] < rank[right_root]:
+            parent[left_root] = right_root
+        elif rank[left_root] > rank[right_root]:
+            parent[right_root] = left_root
+        else:
+            parent[right_root] = left_root
+            rank[left_root] += 1
+
+    roots = np.fromiter((find(vertex) for vertex in range(vertex_count)),
+                        dtype=np.int64, count=vertex_count)
+    _roots, labels = np.unique(roots, return_inverse=True)
+    return len(_roots), labels.astype(np.int64, copy=False)
+
+
+def _connected_components(graph):
+    """Use SciPy when available, with a dependency-light fallback."""
+    try:
+        return sp.sparse.csgraph.connected_components(graph, directed=False)
+    except (ImportError, ModuleNotFoundError):
+        coo = graph.tocoo()
+        edges = np.column_stack((coo.row, coo.col))
+        return _union_find_components(graph.shape[0], edges)
 
 
 def find_vertex_merge_map(vertices, distance):
     """Map nearby vertices to non-destructive, transitively merged clusters."""
     vertices = np.asarray(vertices)
+    if vertices.ndim != 2 or vertices.shape[1] != 3 or not np.all(np.isfinite(vertices)):
+        raise ValueError("Cannot virtually merge invalid vertex coordinates")
+    if not np.isfinite(distance) or distance < 0:
+        raise ValueError("Virtual merge distance must be finite and non-negative")
     vertex_count = len(vertices)
     identity = np.arange(vertex_count, dtype=np.int64)
     if vertex_count == 0 or distance <= 0:
@@ -266,9 +316,7 @@ def find_vertex_merge_map(vertices, distance):
         (np.ones(rows.size, dtype=np.uint8), (rows, cols)),
         shape=(vertex_count, vertex_count),
     ).tocsr()
-    _component_count, labels = sp.sparse.csgraph.connected_components(
-        graph, directed=False
-    )
+    _component_count, labels = _connected_components(graph)
     return labels.astype(np.int64, copy=False)
 
 
@@ -310,6 +358,124 @@ def _collapse_vertices_for_inpainting(V2, F2, W2, Matched, merge_map):
     return merged_vertices, merged_faces, merged_weights, merged_matched
 
 
+@dataclass
+class InpaintingDomain:
+    weights: np.ndarray
+    matched: np.ndarray
+    merge_map: np.ndarray
+    laplacian: object
+    mass: np.ndarray
+    rejected: np.ndarray
+
+
+class InpaintingError(ValueError):
+    def __init__(self, message, rejected=None):
+        super().__init__(message)
+        self.rejected = rejected
+
+
+def prepare_inpainting(V2, F2, W2, Matched, point_cloud, virtual_merge_distance=0.0):
+    """Build the actual solver graph, shared by solving and loose-part selection."""
+    V = np.asarray(V2, dtype=np.float64)
+    F = np.asarray(F2)
+    W = np.asarray(W2, dtype=np.float64)
+    matched = np.asarray(Matched, dtype=bool)
+    if (V.ndim != 2 or V.shape[1] != 3 or not len(V)
+            or not np.all(np.isfinite(V))):
+        raise InpaintingError("Target vertices must be a nonempty finite N by 3 array")
+    if (F.ndim != 2 or F.shape[1] != 3 or not np.issubdtype(F.dtype, np.integer)
+            or np.any(F < 0) or np.any(F >= len(V))):
+        raise InpaintingError("Target contains invalid triangle indices")
+    if (W.ndim != 2 or W.shape[0] != len(V) or not W.shape[1]
+            or not np.all(np.isfinite(W)) or matched.shape != (len(V),)):
+        raise InpaintingError("Target weights or match mask are invalid")
+    if not np.isfinite(virtual_merge_distance) or virtual_merge_distance < 0:
+        raise InpaintingError("Virtual merge distance must be finite and non-negative")
+    # Inpainting does not change fully matched input. Seam synchronization is
+    # deliberately separate and also operates on fully matched meshes.
+    if np.all(matched):
+        return InpaintingDomain(W.copy(), matched, np.arange(len(V)), None,
+                                np.zeros(len(V)), np.zeros(len(V), dtype=bool))
+    merge_map = find_vertex_merge_map(V, virtual_merge_distance)
+    V, F, W, matched = _collapse_vertices_for_inpainting(V, F, W, matched, merge_map)
+    n = len(V)
+    if np.all(matched) or not np.any(matched):
+        return InpaintingDomain(W, matched, merge_map, None, np.zeros(n),
+                                (~matched)[merge_map])
+    use_points = point_cloud and n == len(V2)
+    try:
+        if use_points and n >= 3:
+            L, M = robust_laplacian.point_cloud_laplacian(V, n_neighbors=min(30, n - 1))
+            mass = M.diagonal()
+        else:
+            # Removed faces can leave isolated vertices. Keep their constraints,
+            # but do not feed unused vertices to the native surface builder.
+            F = F[(F[:, 0] != F[:, 1]) & (F[:, 1] != F[:, 2]) & (F[:, 2] != F[:, 0])]
+            if len(F):
+                _, keep = np.unique(np.sort(F, axis=1), axis=0, return_index=True)
+                F = F[np.sort(keep)]
+            active = np.unique(F)
+            L = sp.sparse.csr_matrix((n, n), dtype=np.float64)
+            mass = np.zeros(n, dtype=np.float64)
+            if len(active):
+                remap = np.full(n, -1, dtype=np.int64)
+                remap[active] = np.arange(len(active))
+                local_L, local_M = robust_laplacian.mesh_laplacian(V[active], remap[F])
+                coo = local_L.tocoo()
+                L = sp.sparse.csr_matrix((coo.data, (active[coo.row], active[coo.col])), shape=(n, n))
+                mass[active] = local_M.diagonal()
+        L = L.astype(np.float64).tocsr()
+        if np.any(~np.isfinite(L.data)) or np.any(~np.isfinite(mass)) or np.any(mass < 0):
+            raise InpaintingError("Inpainting produced an invalid Laplacian or mass matrix")
+        graph = L.copy()
+        graph.setdiag(0)
+        graph.eliminate_zeros()
+        count, labels = _connected_components(graph)
+        anchored = np.zeros(count, dtype=bool)
+        anchored[labels[matched]] = True
+        rejected = ~anchored[labels]
+        rejected |= (~matched) & (mass <= 0)
+        return InpaintingDomain(W, matched, merge_map, L, mass, rejected[merge_map])
+    except (RuntimeError, ValueError) as error:
+        raise InpaintingError(str(error)) from error
+
+
+def solve_inpainting(domain, skip_rejected=False):
+    """Solve constrained vertices; optionally leave unsupported output unused.
+
+    Partial transfers discard rejected rows at write time. Those rows must not
+    supply constraints or participate in the supported linear system.
+    """
+    if np.any(domain.rejected) and not skip_rejected:
+        raise InpaintingError("Loose parts without a matched vertex remain in the solver graph",
+                              domain.rejected)
+    W = domain.weights.copy()
+    rejected = np.zeros(len(W), dtype=bool)
+    rejected[domain.merge_map[domain.rejected]] = True
+    active = np.flatnonzero(~rejected)
+    unknown = np.flatnonzero(~domain.matched[active])
+    if len(unknown):
+        L = domain.laplacian[active][:, active]
+        mass = domain.mass[active]
+        inv_mass = np.zeros_like(mass)
+        np.divide(1.0, mass, out=inv_mass, where=mass > 0)
+        Q = L + L @ sp.sparse.diags(inv_mass) @ L
+        known = np.flatnonzero(domain.matched[active])
+        rhs = -(Q[unknown][:, known] @ W[active[known]])
+        try:
+            with warnings.catch_warnings():
+                warnings.simplefilter('error', sp.sparse.linalg.MatrixRankWarning)
+                solution = sp.sparse.linalg.spsolve(Q[unknown][:, unknown].tocsc(), rhs)
+            W[active[unknown]] = np.asarray(solution).reshape(len(unknown), W.shape[1])
+        except (RuntimeError, ValueError, sp.sparse.linalg.MatrixRankWarning) as error:
+            raise InpaintingError("Constrained weight solve failed: " + str(error)) from error
+    with np.errstate(over='ignore'):
+        result = W[domain.merge_map].astype(np.float32)
+    if not np.all(np.isfinite(result)):
+        raise InpaintingError("Inpainting produced non-finite weights")
+    return result
+
+
 def inpaint(V2, F2, W2, Matched, point_cloud, virtual_merge_distance=0.0):
     """
     Inpaint weights for all the vertices on the target mesh for which  we didnt 
@@ -327,69 +493,14 @@ def inpaint(V2, F2, W2, Matched, point_cloud, virtual_merge_distance=0.0):
         W_inpainted: #V2 by num_bones, final skinning weights where we inpainted weights for all vertices i where Matched[i] == False
     """
     
-    V2 = np.asarray(V2)
-    F2 = np.asarray(F2, dtype=np.int64)
-    W2 = np.asarray(W2)
-    Matched = np.asarray(Matched, dtype=bool)
-    failed_weights = np.asarray(W2, dtype=np.float32)
-    if Matched.shape != (V2.shape[0],):
-        return False, failed_weights
-    if np.all(Matched):
-        return True, failed_weights.copy()
-    if not np.any(Matched):
-        return False, failed_weights
-
     try:
-        merge_map = find_vertex_merge_map(V2, virtual_merge_distance)
-    except ValueError:
-        return False, failed_weights
-    V_solve, F_solve, W_solve, Matched_solve = _collapse_vertices_for_inpainting(
-        V2, F2, W2, Matched, merge_map
-    )
-    if np.all(Matched_solve):
-        return True, np.asarray(W_solve[merge_map], dtype=np.float32)
-    has_virtual_merges = len(V_solve) != len(V2)
-    use_point_cloud = point_cloud and not has_virtual_merges
-    if not use_point_cloud and len(F_solve) == 0:
-        return False, failed_weights
+        domain = prepare_inpainting(V2, F2, W2, Matched, point_cloud, virtual_merge_distance)
+        return True, solve_inpainting(domain)
+    except (RuntimeError, ValueError, TypeError):
+        return False, np.asarray(W2, dtype=np.float32)
 
-    try:
-        if use_point_cloud:
-            L, M = robust_laplacian.point_cloud_laplacian(V_solve)
-        else:
-            L, M = robust_laplacian.mesh_laplacian(V_solve, F_solve)
-        L = -L # igl and robust_laplacian have different laplacian conventions
 
-        mass = M.diagonal()
-        if np.any(~np.isfinite(mass)) or np.any(mass <= 0):
-            return False, failed_weights
-        Minv = sp.sparse.diags(1 / mass)
-        Q2 = (-L + L*Minv*L).astype(np.float64)
-        B = np.zeros(shape=(L.shape[0], W_solve.shape[1]), dtype=np.float64)
 
-        b = np.flatnonzero(Matched_solve)
-        bc = W_solve[Matched_solve, :].astype(np.float64)
-        unknown = np.flatnonzero(~Matched_solve)
-        W_inpainted = np.zeros_like(B)
-        W_inpainted[b] = bc
-        if len(unknown):
-            q_uu = Q2[unknown][:, unknown].tocsc()
-            rhs = B[unknown] - Q2[unknown][:, b] @ bc
-            with warnings.catch_warnings():
-                warnings.simplefilter('error', sp.sparse.linalg.MatrixRankWarning)
-                solution = sp.sparse.linalg.spsolve(q_uu, rhs)
-            W_inpainted[unknown] = np.asarray(solution).reshape(len(unknown), -1)
-        result = bool(np.all(np.isfinite(W_inpainted)))
-    except (RuntimeError, ValueError, sp.sparse.linalg.MatrixRankWarning):
-        return False, failed_weights
-
-    if not result:
-        return False, failed_weights
-    W_inpainted = W_inpainted.astype(np.float32)
-    W_inpainted = W_inpainted.reshape(W_solve.shape)[merge_map]
-    return True, W_inpainted
-    
-    
 def limit_mask(weights, adjacency_matrix, dilation_repeat=5, limit_num=4):
     if weights.shape[1] <= limit_num: return np.zeros_like(weights)
     

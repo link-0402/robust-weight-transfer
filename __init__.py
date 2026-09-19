@@ -20,7 +20,7 @@
 bl_info = {
     "name": "Robust Weight Transfer",
     "author": "sentfromspacevr",
-    "version": (1, 2, 0),
+    "version": (1, 2, 2),
     "blender": (5, 2, 0),
     "doc_url": "https://jinxxy.com/SentFromSpaceVR/robust-weight-transfer",
     "location": "View3D > Sidebar > SENT Tab",
@@ -29,7 +29,6 @@ bl_info = {
 
 import sys
 import os
-import site
 
 import bpy
 import bmesh
@@ -44,7 +43,12 @@ libs_path = os.path.join(os.path.dirname(__file__), "deps")
 # Dependencies are installed directly into this add-on-owned directory.  This
 # avoids Blender's read-only Python installation and the fragile --user /
 # PYTHONUSERBASE combination used by older releases of the add-on.
-site.addsitedir(libs_path)
+# Keep this directory ahead of Blender's global site-packages and any other
+# add-on dependency directories. `site.addsitedir` appends it, which can make
+# Python reuse an incomplete SciPy copy from a previous add-on installation.
+if libs_path in sys.path:
+    sys.path.remove(libs_path)
+sys.path.insert(0, libs_path)
 
 DEPENDENCIES = ["robust_laplacian", "scipy"]
 DEPENDENCY_PACKAGES = {
@@ -71,10 +75,14 @@ if not missing_deps:
     # upgrade cannot combine a new __init__.py with old module implementations.
     sys.modules.pop(weighttransfer_module_name, None)
     sys.modules.pop(util_module_name, None)
+    sys.modules.pop(f"{__name__}.seams", None)
+    sys.modules.pop(f"{__name__}.transfer", None)
     importlib.invalidate_caches()
     weighttransfer = importlib.import_module('.weighttransfer', __name__)
     util = importlib.import_module('.util', __name__)
-    from .weighttransfer import build_surface_bvh, find_matches_closest_surface, find_vertex_merge_map, inpaint, limit_mask, smooth_weigths
+    seams = importlib.import_module('.seams', __name__)
+    transfer = importlib.import_module('.transfer', __name__)
+    from .weighttransfer import build_surface_bvh, find_matches_closest_surface, limit_mask, smooth_weigths
 
 
 class RobustWeightTransfer(bpy.types.Operator):
@@ -117,141 +125,59 @@ class RobustWeightTransfer(bpy.types.Operator):
 
 
     def execute(self, context: bpy.types.Context):
-        scene_settings: SceneSettingsGroup = context.scene.robust_weight_transfer_settings
-        
-        source_obj: bpy.types.Object = scene_settings.source_object
-        if source_obj.type != 'MESH':
-            self.report({'ERROR'}, f'Source object {source_obj.name} is not a mesh')
-            return {'CANCELLED'}
-    
-        if scene_settings.apply_to_selected:
-            target_objs = [obj for obj in context.selected_objects if obj != source_obj and isinstance(obj.data, bpy.types.Mesh)]
-        else:
-            target_objs = [context.object]
-        
+        settings = context.scene.robust_weight_transfer_settings
+        source_original = settings.source_object
+        target_objs = ([obj for obj in context.selected_objects
+                        if obj != source_original and obj.type == 'MESH']
+                       if settings.apply_to_selected else [context.object])
         depsgraph = context.evaluated_depsgraph_get()
-        if scene_settings.use_deformed_source:
-            source_obj = source_obj.evaluated_get(depsgraph)
-        
-        weights_all = [] # (num_objs, (num_vertices, num_weights))
-        source_verts, source_triangles, source_normals = util.get_obj_arrs_world(source_obj)
-        if len(source_verts) == 0 or len(source_triangles) == 0:
-            self.report({'ERROR'}, f'Source object {source_obj.name} must contain vertices and faces')
-            return {'CANCELLED'}
-
-        deform_only = scene_settings.group_selection == 'DEFORM_POSE_BONES'
-        is_deform = [util.is_vertex_group_deform_bone(source_obj, g.name) for g in source_obj.vertex_groups]
-        source_weights = util.get_groups_arr(source_obj, is_deform if deform_only else None) # (num_verts, )
-        if source_weights.shape[1] == 0 or (deform_only and not np.any(is_deform)):
-            group_kind = 'deform-bone vertex groups' if deform_only else 'vertex groups'
-            self.report({'ERROR'}, f'Source object {source_obj.name} has no {group_kind} to transfer')
-            return {'CANCELLED'}
-
+        source = source_original.evaluated_get(depsgraph) if settings.use_deformed_source else source_original
+        targets = []
         try:
+            source_verts, source_triangles, source_normals = util.get_obj_arrs_world(source)
             surface_bvh = build_surface_bvh(source_verts, source_triangles)
-        except ValueError as error:
+            names = [g.name for g in source.vertex_groups]
+            deform = [util.is_vertex_group_deform_bone(source, name) for name in names]
+            included = deform if settings.group_selection == 'DEFORM_POSE_BONES' else [True] * len(names)
+            if not any(included):
+                raise ValueError(f'Source object {source.name} has no transferable vertex groups')
+            source_weights = util.get_groups_arr(source, included)
+            for obj in target_objs:
+                target = transfer.make_target(obj, depsgraph, settings)
+                transfer.match_target(target, source_verts, source_triangles, source_normals,
+                                      source_weights, settings, surface_bvh)
+                targets.append(target)
+            fallback = transfer.source_armature(source_original)
+            transfer.solve_targets(targets, settings, fallback, partial=settings.partial_reweight)
+            for target in targets:
+                transfer.process_weights(target, settings)
+                transfer.stage_weights(target, names, included, apply_mask=not settings.apply_to_selected)
+            counts = transfer.synchronize_targets(
+                targets, settings, [name for name, use in zip(names, deform) if use], fallback)
+            post_counts = transfer.postprocess_transfer_targets(
+                targets, settings, [name for name, use in zip(names, deform) if use])
+        except (ValueError, RuntimeError) as error:
             self.report({'ERROR'}, str(error))
             return {'CANCELLED'}
 
-        for obj in target_objs:
-            object_settings: ObjectSettingsGroup = obj.robust_weight_transfer_settings
-            verts, triangles, normals = util.get_obj_arrs_world(obj.evaluated_get(depsgraph) if scene_settings.use_deformed_target else obj)
-            if len(verts) == 0 or len(triangles) == 0:
-                self.report({'ERROR'}, f'Target object {obj.name} must contain vertices and faces')
-                return {'CANCELLED'}
-            matched_verts, weights = find_matches_closest_surface(source_verts, source_triangles, source_normals, verts, normals, source_weights, scene_settings.max_distance**2, math.degrees(scene_settings.max_normal_angle_difference), scene_settings.flip_vertex_normal, surface_bvh)
-            if not scene_settings.apply_to_selected:
-                if util.is_group_valid(obj.vertex_groups, object_settings.inpaint_group):
-                    inpaint_mask = util.get_group_arr(obj, object_settings.inpaint_group)
-                    inpaint_mask_bin = inpaint_mask > object_settings.inpaint_threshold
-                    if object_settings.inpaint_group_invert:
-                        inpaint_mask_bin = ~inpaint_mask_bin
-                    matched_verts = np.logical_and(matched_verts, ~inpaint_mask_bin)
-            
-            
-            if scene_settings.draw_matched:
-                res = util.draw_debug_vertex_colors(obj, matched_verts)
-                if not res:
-                    self.report({'ERROR'}, f'{obj.name} has too many vertex colors. Delete one or deactive Visualize Rejected Weights.')
-                    return {'CANCELLED'}
-
-                
-            virtual_merge_distance = (
-                scene_settings.virtual_merge_distance
-                if scene_settings.virtual_merge else 0.0
-            )
-            result, weights = inpaint(
-                verts, triangles, weights, matched_verts,
-                scene_settings.inpaint_mode == 'POINT', virtual_merge_distance
-            )
-            if not result:
-                self.report({'ERROR'}, f'Failed weight inpainting on {obj.name}: This usually happens on loose parts without a matched vertex. Try Virtual Merge by Distance or use Select Rejected Loose Parts.')
-                return {'CANCELLED'}
-            
-            adj_mat = util.get_mesh_adjacency_matrix_sparse(obj.data, include_self=True)
-            if scene_settings.smoothing_enable:
-                adj_list = util.get_mesh_adjacency_list(obj.data)
-                weights = smooth_weigths(verts, weights, matched_verts, adj_mat, adj_list, scene_settings.smoothing_repeat, scene_settings.smoothing_factor, scene_settings.max_distance)
-            
-            if scene_settings.enforce_four_bone_limit:
-                weights[weights <= 0.0001] = 0
-                mask = limit_mask(weights, adj_mat, limit_num=scene_settings.num_limit_groups)
-                weights = (1 - mask) * weights
-                weights[weights <= 0.0001] = 0
-            
-            weights_all.append(weights)
-        for obj, weights in zip(target_objs, weights_all):
-            object_settings: ObjectSettingsGroup = obj.robust_weight_transfer_settings
-            source_vertex_groups = source_obj.vertex_groups
-            weight_counts = np.count_nonzero(weights, axis=0)
-            for group, w_count in zip(source_vertex_groups, weight_counts):
-                if w_count > 0:
-                    if group.name not in obj.vertex_groups:
-                        obj.vertex_groups.new(name=group.name)
-            
-            is_deform = [util.is_vertex_group_deform_bone(source_obj, g.name) for g in source_vertex_groups]
-            
-            use_mask = not scene_settings.apply_to_selected and util.is_group_valid(obj.vertex_groups, object_settings.vertex_group)
-            if use_mask:
-                mask = util.get_group_arr(obj, object_settings.vertex_group)
-                if object_settings.vertex_group_invert:
-                    mask = 1 - mask
-                current_weights = {group.name: w  for group, w in zip(obj.vertex_groups, util.get_groups_arr(obj).T)}
-                
-            for i, w in enumerate(weights.T):
-                w_count = weight_counts[i]
-                if w_count == 0: continue
-                
-                source_group = source_vertex_groups[i]
-                target_group = obj.vertex_groups[source_group.name]
-                
-                if target_group.lock_weight:
-                    continue
-                if deform_only and not is_deform[i]:
-                    continue
-                
-                if use_mask:
-                    group_name = source_obj.vertex_groups[i].name
-                    current_weight = current_weights[group_name]
-                    w = (1 - mask) * current_weight + mask * w
-                    
-                for j, wv in enumerate(w):
-                    if wv >= 0.00001:
-                        target_group.add([j], wv, 'REPLACE')
-                ind = np.where(w < 0.00001)[0].tolist()
-                target_group.remove(ind)   
-        
-        if scene_settings.draw_matched:
+        # All solves and final seam reconciliation must succeed before any weights
+        # or diagnostic colors are committed to a target.
+        transfer.write_targets(targets)
+        if settings.draw_matched:
+            for target in targets:
+                matched = target['matched']
+                if settings.partial_reweight:
+                    matched = matched | (target['strength'] == 0)
+                util.draw_debug_vertex_colors(target['obj'], matched)
             if isinstance(context.space_data, bpy.types.SpaceView3D):
-                view: bpy.types.SpaceView3D = context.space_data
-                view.shading.type = 'SOLID'
-                view.shading.color_type = 'VERTEX'
-        if scene_settings.apply_to_selected:
-            self.report({'INFO'}, f'Weights transfered from {source_obj.name} to selected objects')
-        else:
-            self.report({'INFO'}, f'Weights transfered from {source_obj.name} to {context.object.name}')
+                context.space_data.shading.type = 'SOLID'
+                context.space_data.shading.color_type = 'VERTEX'
+        transfer.report_seams(self, counts)
+        transfer.report_partial(self, targets)
+        transfer.report_postprocess(self, post_counts)
+        self.report({'INFO'}, f'Weights transferred from {source.name} to {len(targets)} object(s)')
         return {'FINISHED'}
-    
+
 
 class SelectNonMatched(bpy.types.Operator):
     """Select Rejected Loose Parts"""
@@ -271,105 +197,54 @@ class SelectNonMatched(bpy.types.Operator):
         return True
 
     def execute(self, context):
-        bpy.ops.object.mode_set(mode='OBJECT')     
-        scene_settings: SceneSettingsGroup = context.scene.robust_weight_transfer_settings
-        source_obj: bpy.types.Object = scene_settings.source_object
-        
-        depsgraph = context.evaluated_depsgraph_get()
-        if scene_settings.use_deformed_source:
-            source_obj = source_obj.evaluated_get(depsgraph)
-        
-        source_verts, source_triangles, source_normals = util.get_obj_arrs_world(source_obj)
-        if len(source_verts) == 0 or len(source_triangles) == 0:
-            self.report({'ERROR'}, f'Source object {source_obj.name} must contain vertices and faces')
-            return {'CANCELLED'}
-        
-        deform_only = scene_settings.group_selection == 'DEFORM_POSE_BONES'
-        is_deform = [util.is_vertex_group_deform_bone(source_obj, g.name) for g in source_obj.vertex_groups]
-        source_weights = util.get_groups_arr(source_obj, is_deform if deform_only else None)
-        if source_weights.shape[1] == 0 or (deform_only and not np.any(is_deform)):
-            group_kind = 'deform-bone vertex groups' if deform_only else 'vertex groups'
-            self.report({'ERROR'}, f'Source object {source_obj.name} has no {group_kind} to transfer')
-            return {'CANCELLED'}
-        
-        obj = context.active_object
-        verts, triangles, normals = util.get_obj_arrs_world(obj.evaluated_get(depsgraph) if scene_settings.use_deformed_target else obj)
-        if len(verts) == 0 or len(triangles) == 0:
-            self.report({'ERROR'}, f'Target object {obj.name} must contain vertices and faces')
-            return {'CANCELLED'}
+        active = context.active_object
+        settings = context.scene.robust_weight_transfer_settings
+        bpy.ops.object.mode_set(mode='OBJECT')
         try:
-            surface_bvh = build_surface_bvh(source_verts, source_triangles)
-        except ValueError as error:
+            depsgraph = context.evaluated_depsgraph_get()
+            source_original = settings.source_object
+            source = source_original.evaluated_get(depsgraph) if settings.use_deformed_source else source_original
+            vertices, triangles, normals = util.get_obj_arrs_world(source)
+            surface_bvh = build_surface_bvh(vertices, triangles)
+            deform = [util.is_vertex_group_deform_bone(source, g.name) for g in source.vertex_groups]
+            included = deform if settings.group_selection == 'DEFORM_POSE_BONES' else [True] * len(deform)
+            if not any(included):
+                raise ValueError(f'Source object {source.name} has no transferable vertex groups')
+            source_weights = util.get_groups_arr(source, included)
+            across = (settings.apply_to_selected and settings.seam_sync
+                      and settings.seam_sync_across_objects and settings.virtual_merge)
+            objects = ([obj for obj in context.selected_objects
+                        if obj != source_original and obj.type == 'MESH'] if across else [active])
+            targets = []
+            for obj in objects:
+                target = transfer.make_target(obj, depsgraph, settings)
+                transfer.match_target(target, vertices, triangles, normals,
+                                      source_weights, settings, surface_bvh)
+                targets.append(target)
+            batch = next(batch for batch in transfer.batches(
+                targets, across, transfer.source_armature(source_original))
+                if any(t['obj'] == active for t in batch))
+            domain, offsets = transfer.prepare_batch(batch, settings)
+            index = next(i for i, t in enumerate(batch) if t['obj'] == active)
+            selects = domain.rejected[offsets[index]:offsets[index + 1]]
+            if settings.partial_reweight:
+                selects &= batch[index]['strength'] > 0
+        except (ValueError, RuntimeError) as error:
             self.report({'ERROR'}, str(error))
             return {'CANCELLED'}
-        matched_verts, weights = find_matches_closest_surface(source_verts, source_triangles, source_normals, verts, normals, source_weights, scene_settings.max_distance**2, math.degrees(scene_settings.max_normal_angle_difference), scene_settings.flip_vertex_normal, surface_bvh)
-        
-        if not scene_settings.apply_to_selected:
-            object_settings: ObjectSettingsGroup = obj.robust_weight_transfer_settings
-            has_inpaint = len(object_settings.inpaint_group) > 0 and object_settings.inpaint_group in obj.vertex_groups
-            if has_inpaint:
-                inpaint_mask = util.get_group_arr(obj, object_settings.inpaint_group)
-                inpaint_mask_bin = inpaint_mask > object_settings.inpaint_threshold
-                if object_settings.inpaint_group_invert:
-                    inpaint_mask_bin = ~inpaint_mask_bin
-                matched_verts = np.logical_and(matched_verts, ~inpaint_mask_bin)
-        
-        # get loose part meshes
-        rows = np.hstack((triangles[:, 0], triangles[:, 1], triangles[:, 2]))
-        cols = np.hstack((triangles[:, 1], triangles[:, 2], triangles[:, 0]))
-        adjacency = sp.sparse.coo_matrix(
-            (np.ones(rows.size * 2),
-             (np.hstack((rows, cols)), np.hstack((cols, rows)))),
-            shape=(len(verts), len(verts)),
-        ).tocsr()
-        if scene_settings.virtual_merge and scene_settings.virtual_merge_distance > 0:
-            try:
-                merge_map = find_vertex_merge_map(
-                    verts, scene_settings.virtual_merge_distance
-                )
-            except ValueError as error:
-                self.report({'ERROR'}, str(error))
-                return {'CANCELLED'}
-            cluster_count = int(merge_map.max()) + 1 if len(merge_map) else 0
-            representatives = np.full(cluster_count, len(verts), dtype=np.int64)
-            np.minimum.at(representatives, merge_map, np.arange(len(verts)))
-            vertex_indices = np.arange(len(verts), dtype=np.int64)
-            representative_indices = representatives[merge_map]
-            virtual_edges = vertex_indices != representative_indices
-            virtual_rows = vertex_indices[virtual_edges]
-            virtual_cols = representative_indices[virtual_edges]
-            if len(virtual_rows):
-                adjacency += sp.sparse.coo_matrix(
-                    (
-                        np.ones(virtual_rows.size * 2),
-                        (
-                            np.hstack((virtual_rows, virtual_cols)),
-                            np.hstack((virtual_cols, virtual_rows)),
-                        ),
-                    ),
-                    shape=adjacency.shape,
-                ).tocsr()
-        num_conn, conn = sp.sparse.csgraph.connected_components(adjacency, directed=False)
-        conns = [np.where(conn == i)[0] for i in range(num_conn)]
-        matched_per_submesh = [np.count_nonzero(matched_verts[c]) for c in conns]
-        zero_matched_submeshes = [i for i, m in enumerate(matched_per_submesh) if m == 0]
-        
-        selects = np.zeros(verts.shape[0], dtype=bool)
-        for i in zero_matched_submeshes:
-            selects[conns[i]] = True
-        
-        bpy.ops.object.mode_set(mode='EDIT')
-        mesh = bmesh.from_edit_mesh(obj.data)
+        finally:
+            bpy.ops.object.mode_set(mode='EDIT')
+        mesh = bmesh.from_edit_mesh(active.data)
         mesh.verts.ensure_lookup_table()
-        for i, x in enumerate(selects):
-            mesh.verts[i].select_set(bool(x))
+        for vertex, selected in zip(mesh.verts, selects):
+            vertex.select_set(bool(selected))
         mesh.select_flush(True)
         mesh.select_flush(False)
-        bmesh.update_edit_mesh(obj.data, destructive=False)
-        self.report({'INFO'}, f'Selected {np.count_nonzero(selects)} out of {selects.shape[0]} vertices.')
-
+        bmesh.update_edit_mesh(active.data, destructive=False)
+        self.report({'INFO'}, f'Selected {np.count_nonzero(selects)} out of {len(selects)} vertices.')
         return {'FINISHED'}
-    
+
+
 class Inpaint(bpy.types.Operator):
     """Inpaint"""
     bl_idname = "object.rwt_inpaint"
@@ -390,47 +265,32 @@ class Inpaint(bpy.types.Operator):
         return True
 
     def execute(self, context):
-        scene_settings: SceneSettingsGroup = context.scene.robust_weight_transfer_settings
+        settings = context.scene.robust_weight_transfer_settings
         obj = context.active_object
-        object_settings: ObjectSettingsGroup = obj.robust_weight_transfer_settings
-        
-        depsgraph = context.evaluated_depsgraph_get()
-        verts, triangles, normals = util.get_obj_arrs_world(obj.evaluated_get(depsgraph) if scene_settings.use_deformed_target else obj)
-        is_deform = [util.is_vertex_group_deform_bone(obj, g.name) for g in obj.vertex_groups]
-        weights = util.get_groups_arr(obj, is_deform)
-
-        inpaint_mask = util.get_group_arr(obj, object_settings.inpaint_group)
-        inpaint_mask_bin = inpaint_mask > object_settings.inpaint_threshold
-        virtual_merge_distance = (
-            scene_settings.virtual_merge_distance
-            if scene_settings.virtual_merge else 0.0
-        )
-        result, weights = inpaint(
-            verts, triangles, weights, ~inpaint_mask_bin,
-            scene_settings.inpaint_mode == 'POINT', virtual_merge_distance
-        )
-        if not result:
-            self.report({'ERROR'}, f'Failed weight inpainting on {obj.name}: This usually happens on loose parts without a known weight. Try Virtual Merge by Distance or use Select Rejected Loose Parts.')
+        try:
+            target = transfer.make_target(obj, context.evaluated_depsgraph_get(), settings)
+            names = [g.name for g in obj.vertex_groups]
+            deform = [util.is_vertex_group_deform_bone(obj, name) for name in names]
+            if not any(deform):
+                raise ValueError(f'{obj.name} has no deform weights to inpaint')
+            mask = transfer.inpaint_mask(obj)
+            weights = util.get_groups_arr(obj, deform)
+            target.update(weights=weights, matched=~mask)
+            transfer.solve_targets([target], settings)
+            target['weights'][~mask] = weights[~mask]
+            transfer.stage_weights(target, names, deform)
+            target['protected'] = ~mask
+            target['write_vertices'] = mask
+            counts = transfer.synchronize_targets([target], settings,
+                [name for name, use in zip(names, deform) if use])
+        except (ValueError, RuntimeError) as error:
+            self.report({'ERROR'}, str(error))
             return {'CANCELLED'}
-
-        for i, w in enumerate(weights.T):
-            group = obj.vertex_groups[i]
-            if group.lock_weight: continue
-            
-            if not is_deform[i]: continue
-            
-            w_count = np.count_nonzero(w)
-            if w_count == 0: continue
-
-            for j, wv in enumerate(w):
-                if wv >= 0.00001:
-                    group.add([j], wv, 'REPLACE')
-        
-            ind = np.where(w < 0.00001)[0].tolist()
-            group.remove(ind)  
-        self.report({'INFO'}, f'Weights inpainted.')
+        transfer.write_targets([target])
+        transfer.report_seams(self, counts)
+        self.report({'INFO'}, 'Weights inpainted.')
         return {'FINISHED'}
-        
+
 
 class ObjectSettingsGroup(bpy.types.PropertyGroup):
     vertex_group: bpy.props.StringProperty(name='Mask Vertex Group')
@@ -449,11 +309,19 @@ class SceneSettingsGroup(bpy.types.PropertyGroup):
     shape_key_mix: bpy.props.BoolProperty(name='Use Shape Key Mix', description='Uses the Shape of the Shape Key Mix to transfer the weights', default=True)
     max_distance: bpy.props.FloatProperty(
         name='Max Distance',
-        description='Maximum allowed distance between source and destination vertex',
+        description='Maximum world-space distance to the source surface for direct matches; also the outer limit when Partial Reweight is enabled',
         default=0.05,
         min=0,
         unit='LENGTH',
         subtype='DISTANCE')
+    partial_reweight: bpy.props.BoolProperty(
+        name='Partial Reweight',
+        description='Only transfer within Max Distance of the source surface, preserving existing weights outside the range and on unsupported parts',
+        default=False)
+    partial_reweight_falloff: bpy.props.FloatProperty(
+        name='Falloff Width',
+        description='Percentage of Max Distance used to smoothly fade into existing weights at the outer edge; zero gives a hard cutoff',
+        default=20, min=0, max=100, subtype='PERCENTAGE')
     max_normal_angle_difference: bpy.props.FloatProperty(
         name='Max Normal Difference',
         description='Maximum allowed vertex normal difference between source and destination vertex',
@@ -528,6 +396,27 @@ class SceneSettingsGroup(bpy.types.PropertyGroup):
         precision=5,
         unit='LENGTH',
         subtype='DISTANCE')
+    seam_sync: bpy.props.BoolProperty(
+        name='Synchronize Seam Weights',
+        description='Give nearby open borders of separate loose parts identical final deform weights; protected or incompatible seams are skipped',
+        default=False)
+    seam_distance: bpy.props.FloatProperty(
+        name='Seam Distance',
+        description='World-space tolerance between original, undeformed mesh borders; zero matches exact duplicates',
+        default=0.0001, min=0, soft_max=0.01, precision=5,
+        unit='LENGTH', subtype='DISTANCE')
+    seam_sync_across_objects: bpy.props.BoolProperty(
+        name='Across Selected Objects',
+        description='Also synchronize compatible selected targets; with Virtual Merge enabled, share their temporary inpainting solve',
+        default=False)
+    balance_lr_weight_groups: bpy.props.BoolProperty(
+        name='Balance L/R Weight Groups',
+        description='Balance total weights for transferred .L/.R and _l/_r deform-bone pairs while preserving locked and masked weights',
+        default=False)
+    normalize_weights_after_transfer: bpy.props.BoolProperty(
+        name='Normalize Weights After Transfer',
+        description='Normalize all deform weights to one on transfer-touched vertices without changing locked groups',
+        default=False)
     smoothing_enable: bpy.props.BoolProperty(
         name='Enable Smoothing',
         description='Smooths weights in the area where weights got inpainted',
@@ -657,6 +546,15 @@ class SettingsPanel(bpy.types.Panel):
         row = layout.row()
         row.enabled = settings.virtual_merge
         row.prop(settings, 'virtual_merge_distance')
+        layout.prop(settings, 'seam_sync')
+        row = layout.row()
+        row.enabled = settings.seam_sync
+        row.prop(settings, 'seam_distance')
+        row = layout.row()
+        row.enabled = settings.seam_sync and settings.apply_to_selected
+        row.prop(settings, 'seam_sync_across_objects')
+        layout.prop(settings, 'balance_lr_weight_groups')
+        layout.prop(settings, 'normalize_weights_after_transfer')
         layout.prop(settings, 'draw_matched')
         row = layout.row()
         row.enabled = not settings.enforce_four_bone_limit
@@ -675,6 +573,10 @@ class VertexMappingPanel(bpy.types.Panel):
         layout = self.layout
         settings = context.scene.robust_weight_transfer_settings
         layout.prop(settings, "max_distance")
+        layout.prop(settings, "partial_reweight")
+        row = layout.row()
+        row.enabled = settings.partial_reweight
+        row.prop(settings, "partial_reweight_falloff")
         layout.prop(settings, "max_normal_angle_difference")
         layout.prop(settings, "flip_vertex_normal", text='Allow Flipped Vertex Normals')
 

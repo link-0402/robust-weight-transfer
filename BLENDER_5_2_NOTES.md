@@ -46,3 +46,30 @@
   legacy installer can otherwise combine the newly copied `__init__.py` with
   an older `weighttransfer.py` module still held in memory, causing missing
   import errors until Blender is restarted.
+
+## Loose-part solver corrections and seam synchronization
+
+- Explicitly reject solver components with unknown vertices and no matched
+  constraint. Previously, singular solves could return finite zero weights and
+  incorrectly report success, depending on mesh scale.
+- Share actual solver-graph preparation with Select Rejected Loose Parts,
+  including Point mode and virtual cross-object connections.
+- Bound Point mode's neighbor count for small meshes and handle isolated
+  clusters left by collapsed faces without discarding known constraints.
+- Add opt-in Synchronize Seam Weights, Seam Distance, and Across Selected Objects.
+  Final seam weights are reconciled after smoothing, limiting, and mask blending.
+- Support shared virtual inpainting solves for compatible selected targets,
+  retaining each object's topology and matching group names across objects.
+- Preserve locks, non-deform groups, untouched contributions, and transfer masks;
+  report seam clusters that cannot be synchronized within those constraints.
+- Clear stale weights in writable transferred groups even when an entire output
+  column is zero. Honor standalone Inpaint's mask inversion and protected vertices.
+- Reload the new helper modules on in-place upgrades, alongside existing helpers.
+- Add headless Blender numerical and operator regression tests, including actual
+  armature deformation and topology/attribute preservation checks.
+
+## 1.2.1 final-weight controls
+
+- Add opt-in locked-safe deform-weight normalization for transfer-touched vertices.
+- Add opt-in aggregate L/R balancing for transferred `.L`/`.R` and `_l`/`_r`
+  deform-bone pairs.
