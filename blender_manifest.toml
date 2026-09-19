@@ -1,0 +1,39 @@
+schema_version = "1.0.0"
+
+id = "robust_weight_transfer"
+version = "1.2.2"
+name = "Robust Weight Transfer"
+tagline = "Robust vertex weight transfer between meshes with inpainting and seam sync"
+maintainer = "sentfromspacevr"
+type = "add-on"
+
+website = "https://jinxxy.com/SentFromSpaceVR/robust-weight-transfer"
+support = "https://github.com/link-0402/robust-weight-transfer/issues"
+
+tags = ["Rigging", "Mesh"]
+
+blender_version_min = "5.2.0"
+
+# License conforming to https://spdx.org/licenses/ (use "SPDX:" prefix)
+license = [
+  "SPDX:GPL-3.0-or-later",
+]
+
+# Vendored dependencies (robust-laplacian, scipy) are precompiled Windows
+# binaries for Blender 5.2's Python. See build-release.ps1 / deps/.
+platforms = ["windows-x64"]
+
+[permissions]
+network = "Fallback dependency install downloads scipy/robust-laplacian from PyPI"
+files = "Fallback dependency install writes vendored packages into the add-on's deps folder"
+
+[build]
+paths_exclude_pattern = [
+  "__pycache__/",
+  "/.*",
+  "/*.zip",
+  "/dist/",
+  "/tests/",
+  "/blender_repo/",
+  "*.ps1",
+]

@@ -1,0 +1,84 @@
+name: Publish Blender Extension Repository
+
+on:
+  push:
+    branches:
+      - main
+    paths:
+      - '__init__.py'
+      - 'weighttransfer.py'
+      - 'util.py'
+      - 'transfer.py'
+      - 'seams.py'
+      - 'third-logo-icon.png'
+      - 'LICENSE'
+      - 'README.md'
+      - 'blender_manifest.toml'
+      - 'requirements.txt'
+      - 'scripts/install-dependencies.ps1'
+      - 'scripts/package-blender-extension.ps1'
+      - 'scripts/generate-blender-repository.ps1'
+      - 'scripts/verify-blender-repository.ps1'
+      - '.github/workflows/blender-extension-repository.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+concurrency:
+  group: github-pages
+  cancel-in-progress: true
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up GitHub Pages
+        uses: actions/configure-pages@v5
+
+      - name: Install dependency wheels
+        shell: pwsh
+        run: |
+          ./scripts/install-dependencies.ps1
+
+      - name: Install Blender
+        env:
+          BLENDER_VERSION: 5.2.1
+        run: |
+          curl --fail --location --retry 3 \
+            "https://download.blender.org/release/Blender5.2/blender-${BLENDER_VERSION}-linux-x64.tar.xz" \
+            --output /tmp/blender.tar.xz
+          tar -xJf /tmp/blender.tar.xz --directory /tmp
+          echo "/tmp/blender-${BLENDER_VERSION}-linux-x64" >> "$GITHUB_PATH"
+          "/tmp/blender-${BLENDER_VERSION}-linux-x64/blender" --version
+
+      - name: Build extension package and repository index
+        shell: pwsh
+        run: |
+          ./scripts/generate-blender-repository.ps1 -RepositoryPath ./site
+
+      - name: Verify repository metadata
+        shell: pwsh
+        run: |
+          ./scripts/verify-blender-repository.ps1 -RepositoryPath ./site -ExpectedMinimum 5.2.0
+
+      - name: Upload Pages artifact
+        uses: actions/upload-pages-artifact@v3
+        with:
+          path: ./site
+
+  deploy:
+    needs: build
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - name: Deploy to GitHub Pages
+        id: deployment
+        uses: actions/deploy-pages@v4

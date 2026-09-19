@@ -8,6 +8,32 @@ Weight transfer code is based on https://github.com/rin-23/RobustSkinWeightsTran
 
 You can find a tutorial on the Jinxxy page of the addon https://jinxxy.com/SentFromSpaceVR/robust-weight-transfer
 
+## Installation
+
+### Option 1: Install from the web (recommended)
+
+Blender 5.2's **Get Extensions** can install and update the add-on directly
+from this repository's own extension repository:
+
+1. Open **Edit > Preferences > Get Extensions** in Blender.
+2. Click **Repositories**, click **+**, and choose **Add Remote Repository**.
+3. Add this repository URL:
+
+   `https://link-0402.github.io/robust-weight-transfer/index.json`
+4. Enable **Check for Updates on Startup** to receive updates automatically.
+5. Find **Robust Weight Transfer** in the list and install it.
+
+Dependencies (SciPy, robust-laplacian) are bundled in the package, so no
+further setup is required. Only Windows x64 builds are published, matching
+the precompiled dependency wheels.
+
+### Option 2: Install manually
+
+Download the latest release zip from the
+[Releases page](https://github.com/link-0402/robust-weight-transfer/releases)
+and install it via Blender's **Edit > Preferences > Add-ons > Install from
+Disk**.
+
 ## Development
 
 ### Installing Dependencies
@@ -27,6 +53,24 @@ With this `pip` command you can control which platform and for which Python vers
 python -m pip download --platform win_amd64 --python-version 313 --only-binary=:all: --no-deps -d whl -r requirements.txt
 ```
 The dependency wheels get downloaded into the `whl` directory. From here you can unzip the content of the wheels into the `deps` directory
+
+#### Option 3
+`scripts/install-dependencies.ps1` automates Option 2: it downloads the pinned
+wheels and unpacks them into `deps` in one step. This is also what CI uses to
+build the extension repository.
+
+### Building and publishing the extension repository
+
+`scripts/generate-blender-repository.ps1` packages the add-on as a Blender
+Extension (using `blender_manifest.toml`) and generates a static repository
+(`index.json` + `index.html`) via `blender --command extension
+server-generate`. It requires `deps` to already be populated and a `blender`
+executable on PATH (or pass `-BlenderPath`). `scripts/verify-blender-repository.ps1`
+sanity-checks the generated index against the manifest.
+
+The `.github/workflows/blender-extension-repository.yml` workflow runs this
+same pipeline on every push to `main` that touches add-on files and publishes
+the result to GitHub Pages, which is what the web-install URL above serves.
 
 ### Changes to the original addon/repository:
 - Allow flipped normals 
